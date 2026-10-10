@@ -1,17 +1,3 @@
-# DUTA Genetic / Universal ZIP → APK
-# Kontrak SC bot (server.js triggerWorkflow):
-#   workflow_dispatch inputs:
-#     jobId   (string, required)
-#     userId  (string, optional)
-#     payload (string JSON, required)
-#   payload fields:
-#     url, buildType (debug|release), tag, jobId, userId, kind ("genetic")
-# Artifact WAJIB:
-#   name: apk-${{ inputs.jobId }}
-#   path: output/app.apk
-#
-# Support: native Android (tanpa pubspec.yaml), Flutter, HTML→WebView
-
 name: DUTA Genetic APK
 
 on:
