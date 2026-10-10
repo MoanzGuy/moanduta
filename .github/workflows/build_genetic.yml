@@ -1,20 +1,17 @@
-# DUTA Genetic v4 — download pakai dlToken (PAT worker) biar private release tidak 404
+# DUTA Genetic v5 — fix Android SDK (no deprecated "tools" package)
 name: DUTA Genetic APK
 
 on:
   workflow_dispatch:
     inputs:
       jobId:
-        description: Build job ID from SC bot
         required: true
         type: string
       userId:
-        description: Telegram user ID
         required: false
         default: "0"
         type: string
       payload:
-        description: JSON payload from SC bot
         required: true
         type: string
 
@@ -37,36 +34,28 @@ jobs:
       GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
     steps:
       - name: Free disk space
-        shell: bash
         run: |
           set -euo pipefail
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk /opt/ghc || true
           sudo docker image prune -af || true
           df -h /
-          echo "GENETIC_WORKER_VERSION=v4-pattoken-download"
+          echo "GENETIC_WORKER_VERSION=v5-sdk-fix"
 
       - name: Parse payload SC bot
-        shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           import json, os, sys
-          try:
-              p = json.loads(os.environ["PAYLOAD"])
-          except Exception as e:
-              print(f"Invalid payload JSON: {e}")
-              sys.exit(1)
+          p = json.loads(os.environ["PAYLOAD"])
           url = str(p.get("url", "")).strip()
           asset_api = str(p.get("assetApiUrl", "") or "").strip()
           dl_token = str(p.get("dlToken", "") or "").strip()
-          repo = str(p.get("repo", "") or "").strip()
           mode = str(p.get("buildType", "release")).lower()
           kind = str(p.get("kind", "")).lower()
           if dl_token:
-              # Mask token di log GitHub Actions
               print(f"::add-mask::{dl_token}")
           if not url.startswith(("https://", "http://")) and not asset_api.startswith("https://"):
-              sys.exit("Invalid source URL in payload")
+              sys.exit("Invalid source URL")
           if mode in ("genetik", "genetic"):
               mode = "release"
           if mode not in ("debug", "release"):
@@ -78,10 +67,9 @@ jobs:
               f.write(f"SOURCE_URL={esc(url)}\n")
               f.write(f"ASSET_API_URL={esc(asset_api)}\n")
               f.write(f"DL_TOKEN={esc(dl_token)}\n")
-              f.write(f"SRC_REPO={esc(repo)}\n")
               f.write(f"BUILD_TYPE={mode}\n")
               f.write(f"FORCE_TYPE={force}\n")
-          print(f"URL ok, ASSET_API={bool(asset_api)}, HAS_DL_TOKEN={bool(dl_token)}, BUILD_TYPE={mode}, kind={kind}")
+          print(f"ASSET_API={bool(asset_api)} HAS_DL_TOKEN={bool(dl_token)} BUILD_TYPE={mode}")
           PY
 
       - name: Download source ZIP
@@ -91,78 +79,37 @@ jobs:
           set -euo pipefail
           mkdir -p input workspace output
           download_ok=false
-
-          # Pakai PAT worker dulu (bisa baca release private), fallback GITHUB_TOKEN
-          TOKEN="${DL_TOKEN:-}"
-          if [ -z "$TOKEN" ]; then TOKEN="${GH_TOKEN:-}"; fi
-          if [ -n "$TOKEN" ]; then
-            echo "::add-mask::${TOKEN}"
-          fi
+          TOKEN="${DL_TOKEN:-${GH_TOKEN:-}}"
+          [ -n "$TOKEN" ] && echo "::add-mask::${TOKEN}"
           echo "Token present: $([ -n \"$TOKEN\" ] && echo yes || echo no)"
 
-          download_with_token() {
-            local url="$1"
-            local accept="$2"
-            local label="$3"
+          try_dl() {
+            local url="$1" label="$2"
             for i in 1 2 3 4 5 6; do
-              # Simpan headers untuk handle 302 Location
-              HTTP=$(curl -sS -D /tmp/dl_headers -o input/source.zip -w "%{http_code}" \
+              HTTP=$(curl -sS -D /tmp/hdr -o input/source.zip -w "%{http_code}" \
                 -H "Authorization: Bearer ${TOKEN}" \
-                -H "Accept: ${accept}" \
+                -H "Accept: application/octet-stream" \
                 -H "X-GitHub-Api-Version: 2022-11-28" \
-                --connect-timeout 20 --max-time 600 \
-                "$url" || echo "000")
-              # Kalau 302, ikuti Location tanpa strip (signed URL)
+                --connect-timeout 20 --max-time 600 "$url" || echo "000")
               if [ "$HTTP" = "302" ] || [ "$HTTP" = "301" ]; then
-                LOC=$(grep -i '^location:' /tmp/dl_headers | tail -1 | tr -d '\r' | sed 's/^[Ll]ocation: //')
-                if [ -n "$LOC" ]; then
-                  HTTP=$(curl -sS -L -o input/source.zip -w "%{http_code}" \
-                    --connect-timeout 20 --max-time 600 \
-                    "$LOC" || echo "000")
-                fi
+                LOC=$(grep -i '^location:' /tmp/hdr | tail -1 | tr -d '\r' | sed 's/^[Ll]ocation: //')
+                [ -n "$LOC" ] && HTTP=$(curl -sS -L -o input/source.zip -w "%{http_code}" --max-time 600 "$LOC" || echo "000")
               fi
-              # Validasi ZIP magic bytes
-              if [ "$HTTP" = "200" ] && [ -s input/source.zip ]; then
-                if unzip -t input/source.zip >/dev/null 2>&1; then
-                  echo "$label OK (HTTP $HTTP, attempt $i)"
-                  download_ok=true
-                  return 0
-                fi
-                echo "$label HTTP 200 tapi bukan ZIP (attempt $i): $(head -c 80 input/source.zip | tr '\n' ' ')"
-              else
-                echo "$label attempt $i → HTTP $HTTP"
+              if [ "$HTTP" = "200" ] && unzip -t input/source.zip >/dev/null 2>&1; then
+                echo "$label OK attempt $i"; download_ok=true; return 0
               fi
+              echo "$label attempt $i → HTTP $HTTP"
               sleep 3
             done
             return 1
           }
 
-          if [ -n "${ASSET_API_URL:-}" ] && [ -n "$TOKEN" ]; then
-            echo "Download via API asset + PAT..."
-            download_with_token "$ASSET_API_URL" "application/octet-stream" "API" || true
-          fi
-
-          if [ "$download_ok" != "true" ] && [ -n "${SOURCE_URL:-}" ] && [ -n "$TOKEN" ]; then
-            echo "Download via browser URL + PAT..."
-            download_with_token "$SOURCE_URL" "application/octet-stream" "Browser" || true
-          fi
-
-          if [ "$download_ok" != "true" ] && [ -n "${SOURCE_URL:-}" ]; then
-            echo "Public fallback..."
-            HTTP=$(curl -sS -L -o input/source.zip -w "%{http_code}" \
-              -A "SC-BUILD-WORKER/1.0" --connect-timeout 20 --max-time 600 \
-              "$SOURCE_URL" || echo "000")
-            if [ "$HTTP" = "200" ] && unzip -t input/source.zip >/dev/null 2>&1; then
-              download_ok=true
-            fi
-          fi
+          [ -n "${ASSET_API_URL:-}" ] && try_dl "$ASSET_API_URL" "API" || true
+          [ "$download_ok" != "true" ] && [ -n "${SOURCE_URL:-}" ] && try_dl "$SOURCE_URL" "Browser" || true
 
           if [ "$download_ok" != "true" ]; then
-            echo "::error::Gagal download source ZIP."
-            echo "SOURCE_URL=${SOURCE_URL:-}"
-            echo "ASSET_API_URL=${ASSET_API_URL:-}"
-            echo "HAS_TOKEN=$([ -n \"$TOKEN\" ] && echo yes || echo no)"
-            head -c 200 input/source.zip 2>/dev/null || true
+            echo "::error::Gagal download source ZIP"
+            echo "SOURCE_URL=${SOURCE_URL:-}"; echo "ASSET_API_URL=${ASSET_API_URL:-}"
             exit 1
           fi
 
@@ -171,13 +118,10 @@ jobs:
           if [ "$COUNT" -eq 1 ]; then
             ONLY=$(find workspace -mindepth 1 -maxdepth 1 -type d | head -1 || true)
             if [ -n "$ONLY" ]; then
-              shopt -s dotglob
-              mv "$ONLY"/* workspace/ 2>/dev/null || true
-              rmdir "$ONLY" 2>/dev/null || true
+              shopt -s dotglob; mv "$ONLY"/* workspace/ 2>/dev/null || true; rmdir "$ONLY" 2>/dev/null || true
             fi
           fi
-          echo "Workspace tree:"
-          find workspace -maxdepth 4 -type f | sort | head -200
+          find workspace -maxdepth 4 -type f | sort | head -120
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -185,104 +129,89 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK packages
+      # JANGAN pakai android-actions/setup-android@v3 — dia install paket "tools" yang sudah dihapus Google
+      - name: Setup Android SDK (cmdline-tools only)
         run: |
           set -euo pipefail
-          sdkmanager "platform-tools" || true
-          sdkmanager "platforms;android-34" || true
-          sdkmanager "platforms;android-35" || true
-          sdkmanager "build-tools;34.0.0" || true
-          sdkmanager "build-tools;35.0.0" || true
-          yes | sdkmanager --licenses >/dev/null || true
-
-      - name: Detect project type
-        id: detect
-        shell: bash
-        run: |
-          set -euo pipefail
-          REQUESTED="${FORCE_TYPE:-auto}"
-          has_pubspec=false; has_gradle=false; has_html=false
-          if find workspace -type f -name "pubspec.yaml" -print -quit | grep -q .; then has_pubspec=true; fi
-          if find workspace -type f \( -name "gradlew" -o -name "settings.gradle" -o -name "settings.gradle.kts" -o -name "build.gradle" -o -name "build.gradle.kts" \) -print -quit | grep -q .; then has_gradle=true; fi
-          if find workspace -type f -name "*.html" -print -quit | grep -q .; then has_html=true; fi
-          if [ "$REQUESTED" = "android" ]; then
-            if $has_gradle; then echo "type=android" >> "$GITHUB_OUTPUT"; exit 0; fi
-            if $has_pubspec; then echo "type=flutter" >> "$GITHUB_OUTPUT"; exit 0; fi
-            if $has_html; then echo "type=webview" >> "$GITHUB_OUTPUT"; exit 0; fi
-            echo "type=unknown" >> "$GITHUB_OUTPUT"; exit 0
+          ANDROID_HOME="${HOME}/android-sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/cmdtools.zip
+          rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+          unzip -q /tmp/cmdtools.zip -d "$ANDROID_HOME/cmdline-tools"
+          # zip berisi folder cmdline-tools/ → pindah ke latest/
+          if [ -d "$ANDROID_HOME/cmdline-tools/cmdline-tools" ]; then
+            mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
           fi
-          if $has_pubspec; then echo "type=flutter" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if $has_gradle; then echo "type=android" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if $has_html; then echo "type=webview" >> "$GITHUB_OUTPUT"; exit 0; fi
-          echo "type=unknown" >> "$GITHUB_OUTPUT"
+          echo "ANDROID_HOME=${ANDROID_HOME}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${ANDROID_HOME}" >> "$GITHUB_ENV"
+          echo "${ANDROID_HOME}/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "${ANDROID_HOME}/platform-tools" >> "$GITHUB_PATH"
+          export PATH="${ANDROID_HOME}/cmdline-tools/latest/bin:${PATH}"
+          yes | sdkmanager --sdk_root="${ANDROID_HOME}" --licenses >/dev/null || true
+          sdkmanager --sdk_root="${ANDROID_HOME}" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "platforms;android-35" \
+            "build-tools;34.0.0" \
+            "build-tools;35.0.0"
+          echo "SDK ready at ${ANDROID_HOME}"
+          ls "${ANDROID_HOME}/platforms" || true
 
-      - name: Locate Android project
+      - name: Detect type
+        id: detect
+        run: |
+          set -euo pipefail
+          has_gradle=false
+          find workspace -type f \( -name gradlew -o -name settings.gradle -o -name settings.gradle.kts -o -name build.gradle \) -print -quit | grep -q . && has_gradle=true
+          if $has_gradle; then echo "type=android" >> "$GITHUB_OUTPUT"
+          elif find workspace -name pubspec.yaml -print -quit | grep -q .; then echo "type=flutter" >> "$GITHUB_OUTPUT"
+          else echo "type=unknown" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Locate Android
         if: steps.detect.outputs.type == 'android'
-        shell: bash
         run: |
           set -euo pipefail
           ROOT=""
           if [ -f workspace/android/settings.gradle ] || [ -f workspace/android/settings.gradle.kts ] || [ -f workspace/android/gradlew ]; then
             ROOT="workspace/android"
           fi
-          if [ -z "$ROOT" ]; then
-            while IFS= read -r s; do
-              d="$(dirname "$s")"
-              if [ -f "$d/gradlew" ]; then ROOT="$d"; break; fi
-            done < <(find workspace -type f \( -name settings.gradle -o -name settings.gradle.kts \) | sort)
-          fi
-          if [ -z "$ROOT" ]; then
-            ROOT="$(find workspace -type f \( -name settings.gradle -o -name settings.gradle.kts \) -print -quit | xargs -r dirname || true)"
-          fi
-          if [ -z "$ROOT" ]; then
-            ROOT="$(find workspace -type f -name gradlew -print -quit | xargs -r dirname || true)"
-          fi
-          if [ -z "$ROOT" ]; then
-            echo "::error::Android project tidak ditemukan"; find workspace -maxdepth 4 -type f | head -80; exit 1
-          fi
+          [ -z "$ROOT" ] && ROOT="$(find workspace -name settings.gradle -print -quit | xargs -r dirname || true)"
+          [ -z "$ROOT" ] && ROOT="$(find workspace -name settings.gradle.kts -print -quit | xargs -r dirname || true)"
+          [ -z "$ROOT" ] && ROOT="$(find workspace -name gradlew -print -quit | xargs -r dirname || true)"
+          [ -z "$ROOT" ] && { echo "::error::Android root not found"; find workspace -maxdepth 4 -type f | head -80; exit 1; }
           echo "ANDROID_PROJECT=$ROOT" >> "$GITHUB_ENV"
-          echo "Android root: $ROOT"
-          ls -la "$ROOT" | head -30
+          echo "Root: $ROOT"; ls -la "$ROOT" | head -20
 
-      - name: Bootstrap Gradle + local.properties
+      - name: Gradle bootstrap + build
         if: steps.detect.outputs.type == 'android'
         working-directory: ${{ env.ANDROID_PROJECT }}
-        shell: bash
         run: |
           set -euo pipefail
-          GRADLE_VER="8.7"
-          if [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
-            VER="$(grep -oE 'gradle-[0-9.]+' gradle/wrapper/gradle-wrapper.properties | head -1 | sed 's/gradle-//' || true)"
-            [ -n "${VER:-}" ] && GRADLE_VER="$VER"
-          fi
+          GRADLE_VER=8.7
           mkdir -p gradle/wrapper
-          if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
-            curl -fsSL "https://github.com/gradle/gradle/raw/v8.7.0/gradle/wrapper/gradle-wrapper.jar" \
+          if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            curl -fsSL https://github.com/gradle/gradle/raw/v8.7.0/gradle/wrapper/gradle-wrapper.jar \
               -o gradle/wrapper/gradle-wrapper.jar || true
           fi
-          if [ ! -f "./gradlew" ]; then
-            if ! command -v gradle >/dev/null 2>&1; then
-              curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip" -o /tmp/gradle.zip
-              sudo unzip -q /tmp/gradle.zip -d /opt
-              sudo ln -sfn "/opt/gradle-${GRADLE_VER}/bin/gradle" /usr/local/bin/gradle
-            fi
-            gradle wrapper --gradle-version "$GRADLE_VER" || true
+          if [ ! -f ./gradlew ]; then
+            curl -fsSL "https://services.gradle.org/distributions/gradle-${GRADLE_VER}-bin.zip" -o /tmp/g.zip
+            sudo unzip -q /tmp/g.zip -d /opt
+            sudo ln -sfn /opt/gradle-${GRADLE_VER}/bin/gradle /usr/local/bin/gradle
+            gradle wrapper --gradle-version $GRADLE_VER || true
           fi
-          if [ -f "gradle/wrapper/gradle-wrapper.properties" ]; then
+          if [ -f gradle/wrapper/gradle-wrapper.properties ]; then
             sed -i -E "s#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-${GRADLE_VER}-all.zip#" \
               gradle/wrapper/gradle-wrapper.properties
           fi
-          [ -f "./gradlew" ] && chmod +x ./gradlew
-          yes | sdkmanager --licenses >/dev/null || true
+          chmod +x ./gradlew 2>/dev/null || true
+          # local.properties
           if [ -n "${ANDROID_HOME:-}" ]; then echo "sdk.dir=${ANDROID_HOME}" > local.properties
           elif [ -n "${ANDROID_SDK_ROOT:-}" ]; then echo "sdk.dir=${ANDROID_SDK_ROOT}" > local.properties
           fi
+          cat local.properties || true
           # Release signing fallback
-          if [ -f "app/build.gradle" ] && [ "${BUILD_TYPE}" = "release" ]; then
-            if ! grep -q 'signingConfig signingConfigs.debug' app/build.gradle; then
+          if [ -f app/build.gradle ] && [ "${BUILD_TYPE}" = "release" ]; then
+            grep -q 'signingConfig signingConfigs.debug' app/build.gradle || \
               python3 -c "
           import re,pathlib
           p=pathlib.Path('app/build.gradle')
@@ -290,71 +219,36 @@ jobs:
           t=re.sub(r'(release\s*\{)', r'\1\n            signingConfig signingConfigs.debug', t, count=1)
           p.write_text(t)
           " || true
-            fi
           fi
-
-      - name: Build native Android APK
-        if: steps.detect.outputs.type == 'android'
-        working-directory: ${{ env.ANDROID_PROJECT }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          GRADLE="./gradlew"; [ -f "$GRADLE" ] || GRADLE="gradle"
-          chmod +x ./gradlew 2>/dev/null || true
-          TASK="assembleDebug"; [ "${BUILD_TYPE}" = "release" ] && TASK="assembleRelease"
-          echo "Running: $GRADLE --no-daemon $TASK"
+          TASK=assembleDebug
+          [ "${BUILD_TYPE}" = "release" ] && TASK=assembleRelease
+          echo "Running ./gradlew --no-daemon $TASK"
           set +e
-          $GRADLE --no-daemon --stacktrace "$TASK"
+          ./gradlew --no-daemon --stacktrace $TASK
           CODE=$?
           set -e
           if [ $CODE -ne 0 ] && [ "$TASK" = "assembleRelease" ]; then
             echo "Release gagal → fallback assembleDebug"
-            $GRADLE --no-daemon --stacktrace assembleDebug
+            ./gradlew --no-daemon --stacktrace assembleDebug
           elif [ $CODE -ne 0 ]; then
-            $GRADLE --no-daemon --stacktrace --refresh-dependencies "$TASK"
+            ./gradlew --no-daemon --stacktrace --refresh-dependencies $TASK
           fi
 
       - name: Collect APK
         if: steps.detect.outputs.type == 'android'
-        shell: bash
         run: |
           set -euo pipefail
           mkdir -p output
-          APK="$(find "$ANDROID_PROJECT" -type f -path '*/build/outputs/apk/*' -name '*.apk' -size +10k | head -1 || true)"
-          [ -z "${APK:-}" ] && APK="$(find "$ANDROID_PROJECT" -type f -name '*.apk' -size +10k | head -1 || true)"
-          if [ -z "${APK:-}" ]; then
-            echo "::error::APK tidak ditemukan"
-            find "$ANDROID_PROJECT" -name '*.apk' -print || true
-            exit 1
-          fi
+          APK="$(find "$ANDROID_PROJECT" -path '*/build/outputs/apk/*' -name '*.apk' -size +10k | head -1 || true)"
+          [ -z "$APK" ] && APK="$(find "$ANDROID_PROJECT" -name '*.apk' -size +10k | head -1 || true)"
+          [ -z "$APK" ] && { echo "::error::APK missing"; find "$ANDROID_PROJECT" -name '*.apk' -print || true; exit 1; }
           cp "$APK" output/app.apk
           ls -lh output/app.apk
 
-      - name: Setup Flutter
-        if: steps.detect.outputs.type == 'flutter'
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
-      - name: Flutter build
-        if: steps.detect.outputs.type == 'flutter'
-        shell: bash
-        run: |
-          set -euo pipefail
-          ROOT="$(find workspace -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
-          cd "$ROOT"
-          flutter pub get
-          if [ "${BUILD_TYPE}" = "debug" ]; then flutter build apk --debug; else flutter build apk --release; fi
-          mkdir -p "$GITHUB_WORKSPACE/output"
-          APK="$(find . -path '*/build/*' -name '*.apk' -size +10k | head -1)"
-          cp "$APK" "$GITHUB_WORKSPACE/output/app.apk"
-
-      - name: Fail if unknown
+      - name: Fail unknown
         if: steps.detect.outputs.type == 'unknown'
         run: |
           echo "::error::Project tidak dikenali"
-          find workspace -maxdepth 4 -type f | head -80
           exit 1
 
       - name: Upload APK artifact
