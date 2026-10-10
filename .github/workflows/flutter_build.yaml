@@ -1,0 +1,156 @@
+name: DUTA Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobId:
+        description: Build job ID
+        required: true
+        type: string
+      userId:
+        description: Telegram user ID
+        required: true
+        type: string
+      payload:
+        description: JSON payload from DUTA bot
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: duta-flutter-${{ inputs.jobId }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      JOB_ID: ${{ inputs.jobId }}
+      USER_ID: ${{ inputs.userId }}
+      PAYLOAD: ${{ inputs.payload }}
+      PUB_CACHE: ${{ github.workspace }}/.pub-cache
+      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g
+
+    steps:
+      - name: 01 • Checkout worker
+        uses: actions/checkout@v4
+
+      - name: 02 • Parse build payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys
+          try:
+              p=json.loads(os.environ.get('PAYLOAD',''))
+          except Exception as exc:
+              print(f'Invalid payload JSON: {exc}'); sys.exit(1)
+          url=str(p.get('url','')).strip()
+          mode=str(p.get('buildType','release')).lower()
+          if not url.startswith(('http://','https://')):
+              print('Payload source URL is invalid'); sys.exit(1)
+          if mode not in ('release','debug'): mode='release'
+          def esc(v): return str(v).replace('%','%25').replace('\n','%0A').replace('\r','%0D')
+          with open(os.environ['GITHUB_ENV'],'a') as f:
+              f.write(f'SOURCE_URL={esc(url)}\nBUILD_TYPE={mode}\n')
+          PY
+
+      - name: 03 • Download source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p input
+          curl --fail --location --retry 5 --retry-delay 2 --connect-timeout 20 --max-time 600 \
+            -A 'DUTA-BOT-APPS/1.0' "$SOURCE_URL" -o input/source.zip
+          test -s input/source.zip
+          unzip -t input/source.zip >/dev/null
+
+      - name: 04 • Extract Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p project
+          unzip -q input/source.zip -d project/unpacked
+          ROOT="$(find project/unpacked -name pubspec.yaml -type f -print -quit | xargs -r dirname)"
+          test -n "$ROOT" && test -f "$ROOT/pubspec.yaml"
+          cp -a "$ROOT"/. project/
+          test -f project/pubspec.yaml
+          echo "PROJECT_DIR=$PWD/project" >> "$GITHUB_ENV"
+
+      - name: 05 • Setup Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+          cache-key: flutter-${{ runner.os }}-${{ hashFiles('project/pubspec.lock', 'project/pubspec.yaml') }}
+
+      - name: 06 • Normalize Android Gradle wrapper
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f android/gradle/wrapper/gradle-wrapper.properties ]]; then
+            python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p=Path('android/gradle/wrapper/gradle-wrapper.properties')
+          s=p.read_text(errors='ignore')
+          m=re.search(r'distributionUrl=.*gradle-([0-9.]+)-',s)
+          if m:
+              parts=tuple(int(x) for x in m.group(1).split('.'))
+              if parts < (8,14,0):
+                  s=re.sub(r'https?://[^\\s]*gradle-[0-9.]+-(?:bin|all)\\.zip', 'https\\://services.gradle.org/distributions/gradle-8.14.4-all.zip', s)
+                  p.write_text(s)
+          PY
+          fi
+
+      - name: 07 • Flutter dependencies
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter --version
+          flutter pub get
+
+      - name: 08 • Build APK
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$BUILD_TYPE" == "debug" ]]; then
+            flutter build apk --debug --no-pub
+          else
+            flutter build apk --release --no-pub
+          fi
+
+      - name: 09 • Retry dependency validation bypass
+        if: failure()
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$BUILD_TYPE" == "debug" ]]; then
+            flutter build apk --debug --no-pub --android-skip-build-dependency-validation
+          else
+            flutter build apk --release --no-pub --android-skip-build-dependency-validation
+          fi
+
+      - name: 10 • Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: project/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: 11 • Diagnostics
+        if: failure()
+        working-directory: project
+        run: |
+          echo '--- flutter ---'; flutter --version || true
+          echo '--- gradle wrapper ---'; cat android/gradle/wrapper/gradle-wrapper.properties 2>/dev/null || true
+          echo '--- project ---'; find android -maxdepth 3 -type f | sort | head -200 || true
