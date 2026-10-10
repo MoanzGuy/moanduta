@@ -1,4 +1,4 @@
-name: DUTA Flutter APK
+name: DUTA Fluttertrue
 
 on:
   workflow_dispatch:
