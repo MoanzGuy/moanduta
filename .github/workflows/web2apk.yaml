@@ -1,4 +1,4 @@
-name: DUTA Web2APK
+name: DUTA Web2APk
 
 on:
   workflow_dispatch:
