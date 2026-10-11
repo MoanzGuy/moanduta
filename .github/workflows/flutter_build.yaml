@@ -1,4 +1,4 @@
-name: DUTA Fluttertrue
+name: Flutter Build
 
 on:
   workflow_dispatch:
@@ -12,145 +12,336 @@ on:
         required: true
         type: string
       payload:
-        description: JSON payload from DUTA bot
+        description: Build payload JSON
         required: true
         type: string
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: duta-flutter-${{ inputs.jobId }}
+  group: flutter-${{ inputs.jobId }}
   cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    env:
-      JOB_ID: ${{ inputs.jobId }}
-      USER_ID: ${{ inputs.userId }}
-      PAYLOAD: ${{ inputs.payload }}
-      PUB_CACHE: ${{ github.workspace }}/.pub-cache
-      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx4g
+    name: Flutter APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
 
     steps:
-      - name: 01 • Checkout worker
-        uses: actions/checkout@v4
 
-      - name: 02 • Parse build payload
+      - name: "01 • Parse payload"
+        env:
+          BUILD_PAYLOAD: ${{ inputs.payload }}
         shell: bash
         run: |
           set -euo pipefail
+
           python3 - <<'PY'
-          import json, os, sys
+          import json, os
+
+          raw = os.environ.get("BUILD_PAYLOAD", "").strip()
+          if not raw:
+              raise SystemExit("ERROR: payload kosong")
           try:
-              p=json.loads(os.environ.get('PAYLOAD',''))
-          except Exception as exc:
-              print(f'Invalid payload JSON: {exc}'); sys.exit(1)
-          url=str(p.get('url','')).strip()
-          mode=str(p.get('buildType','release')).lower()
-          if not url.startswith(('http://','https://')):
-              print('Payload source URL is invalid'); sys.exit(1)
-          if mode not in ('release','debug'): mode='release'
-          def esc(v): return str(v).replace('%','%25').replace('\n','%0A').replace('\r','%0D')
-          with open(os.environ['GITHUB_ENV'],'a') as f:
-              f.write(f'SOURCE_URL={esc(url)}\nBUILD_TYPE={mode}\n')
+              data = json.loads(raw)
+          except Exception as e:
+              raise SystemExit(f"ERROR: JSON invalid: {e}")
+          if not isinstance(data, dict):
+              raise SystemExit("ERROR: payload harus JSON object")
+
+          source_url = (
+              data.get("url") or data.get("sourceUrl") or data.get("source_url")
+              or data.get("zipUrl") or data.get("zip_url")
+          )
+          if not source_url:
+              raise SystemExit("ERROR: URL source ZIP tidak ditemukan")
+
+          build_type = str(
+              data.get("buildType") or data.get("build_type") or "release"
+          ).strip().lower()
+          if build_type not in ("release", "debug", "profile"):
+              build_type = "release"
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"SOURCE_URL={source_url}\n")
+              f.write(f"BUILD_TYPE={build_type}\n")
+
+          print("Source URL :", source_url)
+          print("Build type :", build_type)
           PY
 
-      - name: 03 • Download source ZIP
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p input
-          curl --fail --location --retry 5 --retry-delay 2 --connect-timeout 20 --max-time 600 \
-            -A 'DUTA-BOT-APPS/1.0' "$SOURCE_URL" -o input/source.zip
-          test -s input/source.zip
-          unzip -t input/source.zip >/dev/null
+      - name: "02 • Setup Java (pre-detect)"
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          # Default 17 — akan di-override kalau Gradle versi lama terdeteksi
+          java-version: "17"
 
-      - name: 04 • Extract Flutter project
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p project
-          unzip -q input/source.zip -d project/unpacked
-          ROOT="$(find project/unpacked -name pubspec.yaml -type f -print -quit | xargs -r dirname)"
-          test -n "$ROOT" && test -f "$ROOT/pubspec.yaml"
-          cp -a "$ROOT"/. project/
-          test -f project/pubspec.yaml
-          echo "PROJECT_DIR=$PWD/project" >> "$GITHUB_ENV"
-
-      - name: 05 • Setup Flutter stable
+      - name: "03 • Setup Flutter stable"
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
-          cache-key: flutter-${{ runner.os }}-${{ hashFiles('project/pubspec.lock', 'project/pubspec.yaml') }}
+          pub-cache: true
 
-      - name: 06 • Normalize Android Gradle wrapper
-        working-directory: project
+      # Cache Gradle — key stabil supaya selalu hit setelah run pertama
+      - name: "04 • Cache Gradle"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper/dists
+          key: gradle-flutter-v1-${{ runner.os }}
+          restore-keys: gradle-flutter-v1-
+
+      - name: "05 • Cache pub"
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-flutter-v1-${{ runner.os }}
+          restore-keys: pub-flutter-v1-
+
+      - name: "06 • Download + validate + extract source ZIP"
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -f android/gradle/wrapper/gradle-wrapper.properties ]]; then
-            python3 - <<'PY'
-          from pathlib import Path
-          import re
-          p=Path('android/gradle/wrapper/gradle-wrapper.properties')
-          s=p.read_text(errors='ignore')
-          m=re.search(r'distributionUrl=.*gradle-([0-9.]+)-',s)
-          if m:
-              parts=tuple(int(x) for x in m.group(1).split('.'))
-              if parts < (8,14,0):
-                  s=re.sub(r'https?://[^\\s]*gradle-[0-9.]+-(?:bin|all)\\.zip', 'https\\://services.gradle.org/distributions/gradle-8.14.4-all.zip', s)
-                  p.write_text(s)
+
+          rm -rf source source.zip
+
+          echo "Downloading..."
+
+          curl \
+            --fail --show-error --location \
+            --retry 6 --retry-delay 2 \
+            --connect-timeout 30 --max-time 600 \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            "${SOURCE_URL}" -o source.zip
+
+          SIZE="$(stat -c '%s' source.zip 2>/dev/null || echo 0)"
+          echo "ZIP size: ${SIZE} bytes"
+          [ "${SIZE:-0}" -ge 1024 ] || { echo "ERROR: ZIP terlalu kecil"; exit 1; }
+
+          python3 - <<'PY'
+          import zipfile
+          from pathlib import PurePosixPath
+
+          path = "source.zip"
+          if not zipfile.is_zipfile(path):
+              raise SystemExit("ERROR: bukan ZIP valid")
+          with zipfile.ZipFile(path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise SystemExit(f"ERROR: ZIP corrupt: {bad}")
+              for item in z.infolist():
+                  name = item.filename.replace("\\", "/")
+                  parts = PurePosixPath(name).parts
+                  if name.startswith("/") or ".." in parts:
+                      raise SystemExit(f"ERROR: unsafe path: {name}")
+          print("ZIP OK")
           PY
-          fi
 
-      - name: 07 • Flutter dependencies
-        working-directory: project
+          mkdir -p source
+          unzip -q source.zip -d source
+          echo "Extracted."
+
+      - name: "07 • Locate Flutter project + detect versions"
         shell: bash
         run: |
           set -euo pipefail
+
+          # Cari project root
+          PROJECT_ROOT=""
+          while IFS= read -r ps; do
+            DIR="$(dirname "$ps")"
+            if [ -d "$DIR/lib" ] && [ -d "$DIR/android" ]; then
+              PROJECT_ROOT="$DIR"
+              break
+            fi
+          done < <(find "$PWD/source" -type f -name pubspec.yaml | sort)
+
+          [ -n "$PROJECT_ROOT" ] || {
+            echo "ERROR: Flutter project tidak ditemukan"
+            find source -name pubspec.yaml | head -10
+            exit 1
+          }
+
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+          echo "Project: $PROJECT_ROOT"
+
+          cd "$PROJECT_ROOT"
+
+          # Detect Flutter revision dari .metadata
+          FLUTTER_REVISION=""
+          if [ -f ".metadata" ]; then
+            FLUTTER_REVISION="$(
+              awk '/^[[:space:]]+revision:/ {
+                v=$0
+                sub(/^[[:space:]]+revision:[[:space:]]*/, "", v)
+                gsub(/["'"'"']/, "", v)
+                print v; exit
+              }' .metadata | tr -d '[:space:]'
+            )"
+          fi
+          echo "FLUTTER_REVISION=${FLUTTER_REVISION}" >> "$GITHUB_ENV"
+          echo "Flutter revision: ${FLUTTER_REVISION:-NOT FOUND (stable akan dipakai)}"
+
+          # Detect Gradle + Java version yang dibutuhkan
+          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
+          GRADLE_VERSION=""
+          if [ -f "$WRAPPER" ]; then
+            GRADLE_VERSION="$(
+              sed -nE 's/.*gradle-([0-9]+([.][0-9]+){1,2})-.*/\1/p' "$WRAPPER" | head -1
+            )"
+          fi
+
+          MAJOR="$(printf '%s' "${GRADLE_VERSION:-0}" | cut -d. -f1)"
+          MINOR="$(printf '%s' "${GRADLE_VERSION:-0}" | cut -d. -f2)"
+          MAJOR="${MAJOR:-0}"; MINOR="${MINOR:-0}"
+
+          if [ "$MAJOR" -lt 7 ] || { [ "$MAJOR" -eq 7 ] && [ "$MINOR" -lt 3 ]; }; then
+            JAVA_VERSION="11"
+          else
+            JAVA_VERSION="17"
+          fi
+
+          echo "GRADLE_VERSION=${GRADLE_VERSION:-UNKNOWN}" >> "$GITHUB_ENV"
+          echo "JAVA_VERSION=$JAVA_VERSION"                >> "$GITHUB_ENV"
+
+          echo "Gradle : ${GRADLE_VERSION:-UNKNOWN}"
+          echo "Java   : $JAVA_VERSION"
+
+      # Re-setup Java kalau ternyata butuh Java 11
+      - name: "08 • Re-setup Java 11 (if needed)"
+        if: env.JAVA_VERSION == '11'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "11"
+
+      # Setup Flutter sesuai revision — coba exact dulu, fallback ke stable
+      - name: "09 • Setup Flutter (exact revision)"
+        if: env.FLUTTER_REVISION != ''
+        uses: subosito/flutter-action@v2
+        with:
+          channel: master
+          flutter-version: ${{ env.FLUTTER_REVISION }}
+          cache: true
+          pub-cache: true
+        continue-on-error: true
+
+      - name: "09b • Setup Flutter (stable fallback)"
+        if: env.FLUTTER_REVISION == ''
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+          pub-cache: true
+
+      - name: "10 • Verify toolchain"
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -version
           flutter --version
-          flutter pub get
+          dart --version
+          cd "$PROJECT_ROOT"
+          chmod +x android/gradlew
+          cd android && ./gradlew --version
 
-      - name: 08 • Build APK
-        working-directory: project
+      - name: "11 • Flutter pub get"
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$BUILD_TYPE" == "debug" ]]; then
-            flutter build apk --debug --no-pub
-          else
-            flutter build apk --release --no-pub
-          fi
+          cd "$PROJECT_ROOT"
+          flutter pub get 2>&1 | tee pub_get.log
 
-      - name: 09 • Retry dependency validation bypass
-        if: failure()
-        working-directory: project
+      - name: "12 • Build APK"
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$PROJECT_ROOT"
+
+          echo "Build type : $BUILD_TYPE"
+          echo "Gradle     : ${GRADLE_VERSION:-UNKNOWN}"
+          echo "Java       : $JAVA_VERSION"
+
+          case "$BUILD_TYPE" in
+            debug)
+              flutter build apk --debug --no-pub \
+                --split-debug-info=/tmp/dbg 2>&1 | tee flutter_build.log ;;
+            profile)
+              flutter build apk --profile --no-pub \
+                --split-debug-info=/tmp/dbg 2>&1 | tee flutter_build.log ;;
+            release|*)
+              flutter build apk --release --no-pub \
+                --split-debug-info=/tmp/dbg 2>&1 | tee flutter_build.log ;;
+          esac
+
+      - name: "13 • Collect APK"
+        if: success()
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$BUILD_TYPE" == "debug" ]]; then
-            flutter build apk --debug --no-pub --android-skip-build-dependency-validation
-          else
-            flutter build apk --release --no-pub --android-skip-build-dependency-validation
-          fi
+          cd "$PROJECT_ROOT"
 
-      - name: 10 • Upload APK
+          rm -rf "$GITHUB_WORKSPACE/output"
+          mkdir -p "$GITHUB_WORKSPACE/output"
+
+          APK_SRC="$(
+            find build/app/outputs/apk \
+              -type f -name "*.apk" | head -1
+          )"
+
+          [ -n "$APK_SRC" ] || {
+            echo "ERROR: APK tidak ditemukan"
+            find build -name "*.apk" | head -20
+            exit 1
+          }
+
+          # Rename pakai jobId supaya bot langsung identifikasi
+          cp "$APK_SRC" "$GITHUB_WORKSPACE/output/app-${{ inputs.jobId }}.apk"
+
+          echo "=========================================="
+          echo " BUILD SUCCESS"
+          echo "=========================================="
+          ls -lh "$GITHUB_WORKSPACE/output/"*.apk
+
+      - name: "14 • Upload APK"
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ inputs.jobId }}
-          path: project/build/app/outputs/flutter-apk/*.apk
+          path: output/app-${{ inputs.jobId }}.apk
           if-no-files-found: error
-          retention-days: 2
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
 
-      - name: 11 • Diagnostics
-        if: failure()
-        working-directory: project
-        run: |
-          echo '--- flutter ---'; flutter --version || true
-          echo '--- gradle wrapper ---'; cat android/gradle/wrapper/gradle-wrapper.properties 2>/dev/null || true
-          echo '--- project ---'; find android -maxdepth 3 -type f | sort | head -200 || true
+      - name: "15 • Upload diagnostics"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-${{ inputs.jobId }}
+          path: |
+            ${{ env.PROJECT_ROOT }}/flutter_build.log
+            ${{ env.PROJECT_ROOT }}/pub_get.log
+            ${{ env.PROJECT_ROOT }}/pubspec.yaml
+            ${{ env.PROJECT_ROOT }}/pubspec.lock
+            ${{ env.PROJECT_ROOT }}/.metadata
+            ${{ env.PROJECT_ROOT }}/android/gradle/wrapper/gradle-wrapper.properties
+            ${{ env.PROJECT_ROOT }}/android/app/build.gradle
+            ${{ env.PROJECT_ROOT }}/android/app/build.gradle.kts
+            ${{ env.PROJECT_ROOT }}/android/build.gradle
+            ${{ env.PROJECT_ROOT }}/android/settings.gradle
+            ${{ env.PROJECT_ROOT }}/android/settings.gradle.kts
+            ${{ env.PROJECT_ROOT }}/android/app/src/main/AndroidManifest.xml
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 6
+          overwrite: true
