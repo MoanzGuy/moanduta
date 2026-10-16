@@ -1,18 +1,18 @@
-name: DUTA Web2APk
+name: Web To APK
 
 on:
   workflow_dispatch:
     inputs:
       jobId:
-        description: Build job ID
+        description: "Unique build job ID"
         required: true
         type: string
       userId:
-        description: Telegram user ID
+        description: "Telegram user ID"
         required: true
         type: string
       payload:
-        description: JSON payload from DUTA bot
+        description: "Build payload JSON (url, appName, packageName)"
         required: true
         type: string
 
@@ -21,235 +21,393 @@ permissions:
   actions: read
 
 concurrency:
-  group: duta-web2apk-${{ inputs.jobId }}
+  group: web2apk-${{ inputs.jobId }}
   cancel-in-progress: false
+
+env:
+  JAVA_VERSION: "17"
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      JOB_ID: ${{ inputs.jobId }}
-      USER_ID: ${{ inputs.userId }}
-      PAYLOAD: ${{ inputs.payload }}
-      ANDROID_HOME: /opt/android-sdk
-      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx3g
+    name: Web To APK Build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
 
     steps:
-      - name: 01 • Checkout
-        uses: actions/checkout@v4
-
-      - name: 02 • Parse payload
+      - name: "01 • Worker information"
         shell: bash
         run: |
           set -euo pipefail
+          echo "=========================================="
+          echo " WEB TO APK WORKER"
+          echo "=========================================="
+          echo "Job ID : ${{ inputs.jobId }}"
+          echo "User ID: ${{ inputs.userId }}"
+          echo "=========================================="
+
+      - name: "02 • Parse payload"
+        shell: bash
+        env:
+          BUILD_PAYLOAD: ${{ inputs.payload }}
+        run: |
+          set -euo pipefail
           python3 - <<'PY'
-          import json, os, sys
-          raw = os.environ.get("PAYLOAD", "")
+          import json, os, re
+
+          raw = os.environ.get("BUILD_PAYLOAD", "").strip()
+          if not raw:
+              raise SystemExit("ERROR: payload kosong")
+
           try:
-              p = json.loads(raw)
-          except Exception as exc:
-              print(f"Invalid payload JSON: {exc}")
-              sys.exit(1)
-          url = str(p.get("url", "")).strip()
-          name = str(p.get("appName", "Duta Web App")).strip()
-          icon = str(p.get("iconUrl", "")).strip()
+              data = json.loads(raw)
+          except Exception as e:
+              raise SystemExit(f"ERROR: payload JSON invalid: {e}")
+
+          if not isinstance(data, dict):
+              raise SystemExit("ERROR: payload harus JSON object")
+
+          url = (
+              data.get("url")
+              or data.get("webUrl")
+              or data.get("web_url")
+              or data.get("website")
+              or data.get("site")
+              or ""
+          )
+          url = str(url).strip()
+          if not url:
+              raise SystemExit("ERROR: URL website tidak ditemukan di payload")
           if not (url.startswith("http://") or url.startswith("https://")):
-              print("Payload URL must start with http:// or https://")
-              sys.exit(1)
-          if not name:
-              name = "Duta Web App"
-          # Keep values safe for GITHUB_ENV; JSON is never interpolated into a shell command.
-          def envsafe(v):
-              return v.replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D")
+              raise SystemExit("ERROR: URL harus http:// atau https://")
+
+          app_name = str(
+              data.get("appName")
+              or data.get("app_name")
+              or data.get("name")
+              or "Web APK"
+          ).strip() or "Web APK"
+          app_name = app_name.replace("\n", " ").replace("\r", " ")[:60]
+
+          package_name = str(
+              data.get("packageName")
+              or data.get("package_name")
+              or "com.duta.webapk"
+          ).strip().lower()
+          if not re.fullmatch(r"[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+", package_name):
+              package_name = "com.duta.webapk"
+
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-              f.write(f"WEB_URL={envsafe(url)}\n")
-              f.write(f"APP_NAME={envsafe(name[:60])}\n")
-              f.write(f"ICON_URL={envsafe(icon)}\n")
+              f.write(f"WEB_URL={url}\n")
+              f.write(f"APP_NAME={app_name}\n")
+              f.write(f"PACKAGE_NAME={package_name}\n")
+
+          print("Website URL :", url)
+          print("App name    :", app_name)
+          print("Package     :", package_name)
           PY
 
-      - name: 03 • Prepare Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: 03b • Install Android platform
-        shell: bash
-        run: |
-          set -euo pipefail
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
-
-      - name: 04 • Download icon
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p app/src/main/res/drawable app/src/main/res/mipmap-hdpi
-          if [[ -n "${ICON_URL:-}" ]]; then
-            curl --fail --location --retry 3 --connect-timeout 15 --max-time 90 \
-              -A 'DUTA-BOT-APPS/1.0' "$ICON_URL" -o app_icon.png
-            file app_icon.png || true
-          fi
-
-      - name: 05 • Generate Android project
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf app src build.gradle settings.gradle gradle.properties gradle
-          mkdir -p app/src/main/java/com/duta/web2apk app/src/main/res/drawable app/src/main/res/mipmap-hdpi
-
-          cat > settings.gradle <<'EOF'
-          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
-          dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }
-          rootProject.name = 'DutaWebAPK'
-          include ':app'
-          EOF
-
-          cat > build.gradle <<'EOF'
-          plugins {
-              id 'com.android.application' version '8.9.1' apply false
-          }
-          EOF
-
-          cat > gradle.properties <<'EOF'
-          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
-          android.useAndroidX=true
-          android.nonTransitiveRClass=true
-          EOF
-
-          cat > app/build.gradle <<'EOF'
-          plugins { id 'com.android.application' }
-
-          android {
-              namespace 'com.duta.web2apk'
-              compileSdk 35
-
-              defaultConfig {
-                  applicationId 'com.duta.web2apk'
-                  minSdk 23
-                  targetSdk 35
-                  versionCode 1
-                  versionName '1.0'
-              }
-
-              buildTypes {
-                  release {
-                      minifyEnabled false
-                      shrinkResources false
-                  }
-              }
-          }
-
-          dependencies {
-              implementation 'androidx.appcompat:appcompat:1.7.0'
-              implementation 'androidx.webkit:webkit:1.13.0'
-          }
-          EOF
-
-          cat > app/src/main/AndroidManifest.xml <<'EOF'
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-            <uses-permission android:name="android.permission.INTERNET" />
-            <application android:theme="@style/AppTheme" android:label="${APP_NAME}" android:usesCleartextTraffic="true" android:allowBackup="false" android:supportsRtl="true">
-              <activity android:name=".MainActivity" android:exported="true">
-                <intent-filter>
-                  <action android:name="android.intent.action.MAIN" />
-                  <category android:name="android.intent.category.LAUNCHER" />
-                </intent-filter>
-              </activity>
-            </application>
-          </manifest>
-          EOF
-
-          mkdir -p app/src/main/res/values
-          cat > app/src/main/res/values/styles.xml <<'EOF'
-          <resources>
-            <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
-              <item name="android:fontFamily">sans</item>
-              <item name="android:colorAccent">#2196F3</item>
-              <item name="android:windowActionModeOverlay">true</item>
-            </style>
-          </resources>
-          EOF
-
-          python3 - <<'PY'
-          import os, html
-          url=html.escape(os.environ['WEB_URL'], quote=True)
-          name=html.escape(os.environ['APP_NAME'], quote=True)
-          p='app/src/main/AndroidManifest.xml'
-          s=open(p,encoding='utf-8').read().replace('${APP_NAME}',name)
-          open(p,'w',encoding='utf-8').write(s)
-          PY
-
-          cat > app/src/main/java/com/duta/web2apk/MainActivity.java <<'EOF'
-          package com.duta.web2apk;
-
-          import android.annotation.SuppressLint;
-          import android.app.Activity;
-          import android.os.Bundle;
-          import android.webkit.WebChromeClient;
-          import android.webkit.WebSettings;
-          import android.webkit.WebView;
-          import android.webkit.WebViewClient;
-
-          public class MainActivity extends Activity {
-              private WebView webView;
-              @SuppressLint("SetJavaScriptEnabled")
-              @Override public void onCreate(Bundle state) {
-                  super.onCreate(state);
-                  webView = new WebView(this);
-                  setContentView(webView);
-                  WebSettings s = webView.getSettings();
-                  s.setJavaScriptEnabled(true);
-                  s.setDomStorageEnabled(true);
-                  s.setDatabaseEnabled(true);
-                  s.setMediaPlaybackRequiresUserGesture(false);
-                  s.setBuiltInZoomControls(false);
-                  s.setDisplayZoomControls(false);
-                  webView.setWebViewClient(new WebViewClient());
-                  webView.setWebChromeClient(new WebChromeClient());
-                  webView.loadUrl(getString(com.duta.web2apk.R.string.web_url));
-              }
-              @Override public void onBackPressed() {
-                  if (webView != null && webView.canGoBack()) webView.goBack(); else super.onBackPressed();
-              }
-          }
-          EOF
-
-          cat > app/src/main/res/values/strings.xml <<EOF
-          <resources>
-            <string name="app_name">$(python3 -c 'import os,html; print(html.escape(os.environ["APP_NAME"]))')</string>
-            <string name="web_url" translatable="false">$(python3 -c 'import os,html; print(html.escape(os.environ["WEB_URL"]))')</string>
-          </resources>
-          EOF
-
-          if [[ -f app_icon.png ]]; then
-            cp app_icon.png app/src/main/res/drawable/app_icon.png
-            cat > app/src/main/res/drawable/icon_bg.xml <<'EOF'
-          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle"><solid android:color="#FFFFFF"/></shape>
-          EOF
-          fi
-
-      - name: 06 • Setup Gradle 8.14.4
-        uses: gradle/actions/setup-gradle@v4
+      - name: "03 • Setup Java 17"
+        uses: actions/setup-java@v4
         with:
-          gradle-version: '8.14.4'
+          distribution: temurin
+          java-version: "17"
 
-      - name: 07 • Build Web APK
+      - name: "04 • Verify Java"
         shell: bash
         run: |
           set -euo pipefail
-          gradle --no-daemon --stacktrace --warning-mode=all assembleRelease
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version
+          javac -version
 
-      - name: 08 • Upload APK
+      - name: "05 • Setup Flutter"
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: "06 • Verify Flutter"
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter --version
+          dart --version
+          flutter precache --android
+          flutter doctor -v || true
+
+      - name: "07 • Create Flutter project"
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf project
+
+          # com.duta.panel → org=com.duta  project-name=panel
+          ORG="$(echo "$PACKAGE_NAME" | awk -F. 'BEGIN{OFS="."} {if(NF>1){NF=NF-1; print} else print "com.duta"}')"
+          PNAME="$(echo "$PACKAGE_NAME" | awk -F. '{print $NF}' | tr -cd 'a-z0-9_')"
+          [ -n "$PNAME" ] || PNAME="webapk"
+          [ -n "$ORG" ] || ORG="com.duta"
+
+          echo "ORG=$ORG PNAME=$PNAME PACKAGE=$PACKAGE_NAME"
+
+          flutter create \
+            --platforms=android \
+            --org="$ORG" \
+            --project-name="$PNAME" \
+            project
+
+          # applicationId + namespace (Groovy atau Kotlin DSL)
+          for GF in project/android/app/build.gradle project/android/app/build.gradle.kts; do
+            [ -f "$GF" ] || continue
+            if [[ "$GF" == *.kts ]]; then
+              sed -i 's/applicationId\s*=\s*".*"/applicationId = "'"$PACKAGE_NAME"'"/' "$GF" || true
+              sed -i 's/namespace\s*=\s*".*"/namespace = "'"$PACKAGE_NAME"'"/' "$GF" || true
+            else
+              sed -i 's/applicationId\s*["'"'"'].*["'"'"']/applicationId "'"$PACKAGE_NAME"'"/' "$GF" || true
+              sed -i 's/namespace\s*["'"'"'].*["'"'"']/namespace "'"$PACKAGE_NAME"'"/' "$GF" || true
+              sed -i 's/applicationId\s*=\s*".*"/applicationId = "'"$PACKAGE_NAME"'"/' "$GF" || true
+              sed -i 's/namespace\s*=\s*".*"/namespace = "'"$PACKAGE_NAME"'"/' "$GF" || true
+            fi
+          done
+
+          # minSdk >= 21
+          for GF in project/android/app/build.gradle project/android/app/build.gradle.kts; do
+            [ -f "$GF" ] || continue
+            sed -i 's/minSdk\s*=\s*[0-9]*/minSdk = 21/' "$GF" || true
+            sed -i 's/minSdkVersion\s*[0-9]*/minSdkVersion 21/' "$GF" || true
+          done
+
+          test -f project/pubspec.yaml
+          test -d project/android
+          test -d project/lib
+
+      - name: "08 • Add WebView dependency"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd project
+          flutter pub add webview_flutter
+          flutter pub get
+
+      - name: "09 • Generate main.dart"
+        shell: bash
+        env:
+          GENERATED_URL: ${{ env.WEB_URL }}
+          GENERATED_APP_NAME: ${{ env.APP_NAME }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os
+
+          url = os.environ["GENERATED_URL"]
+          app_name = os.environ["GENERATED_APP_NAME"]
+          dart_url = json.dumps(url, ensure_ascii=False)
+          dart_name = json.dumps(app_name, ensure_ascii=False)
+
+          code = f'''import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+
+          void main() {{
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const WebApp());
+          }}
+
+          class WebApp extends StatefulWidget {{
+            const WebApp({{super.key}});
+
+            @override
+            State<WebApp> createState() => _WebAppState();
+          }}
+
+          class _WebAppState extends State<WebApp> {{
+            late final WebViewController controller;
+
+            @override
+            void initState() {{
+              super.initState();
+              controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setBackgroundColor(const Color(0xFFFFFFFF))
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onWebResourceError: (error) {{
+                      debugPrint('Web error: ${{error.description}}');
+                    }},
+                  ),
+                )
+                ..loadRequest(Uri.parse({dart_url}));
+            }}
+
+            @override
+            Widget build(BuildContext context) {{
+              return MaterialApp(
+                debugShowCheckedModeBanner: false,
+                title: {dart_name},
+                home: Scaffold(
+                  body: SafeArea(
+                    child: WebViewWidget(controller: controller),
+                  ),
+                ),
+              );
+            }}
+          }}
+          '''
+
+          os.makedirs("project/lib", exist_ok=True)
+          with open("project/lib/main.dart", "w", encoding="utf-8") as f:
+              f.write(code)
+          print("main.dart generated OK")
+          PY
+
+      - name: "10 • AndroidManifest (INTERNET + cleartext)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd project
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+          test -f "$MANIFEST"
+
+          python3 - "$MANIFEST" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          path = sys.argv[1]
+          tree = ET.parse(path)
+          root = tree.getroot()
+          if root.tag != "manifest":
+              raise SystemExit("ERROR: AndroidManifest root invalid")
+
+          NS = "http://schemas.android.com/apk/res/android"
+          ET.register_namespace("android", NS)
+          name_attr = f"{{{NS}}}name"
+          internet = "android.permission.INTERNET"
+
+          has_net = any(
+              n.get(name_attr) == internet
+              for n in root.findall("uses-permission")
+          )
+          if not has_net:
+              node = ET.Element("uses-permission", {name_attr: internet})
+              root.insert(0, node)
+              print("INTERNET permission added")
+          else:
+              print("INTERNET permission already exists")
+
+          # usesCleartextTraffic untuk http://
+          app = root.find("application")
+          if app is not None:
+              clear_attr = f"{{{NS}}}usesCleartextTraffic"
+              if app.get(clear_attr) is None:
+                  app.set(clear_attr, "true")
+                  print("usesCleartextTraffic=true")
+
+          tree.write(path, encoding="utf-8", xml_declaration=True)
+          PY
+
+          grep -q "android.permission.INTERNET" "$MANIFEST"
+
+      - name: "11 • Repair Gradle wrapper"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd project
+          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
+          test -f "$WRAPPER"
+
+          python3 - "$WRAPPER" <<'PY'
+          import re, sys
+          path = sys.argv[1]
+          text = open(path, encoding="utf-8").read()
+          m = re.search(r"gradle-([0-9]+(?:\.[0-9]+){1,2})-", text)
+          current = m.group(1) if m else "0"
+
+          def ver(s):
+              try:
+                  return tuple(int(x) for x in s.split("."))
+              except Exception:
+                  return (0,)
+
+          # Minimal Gradle yang aman untuk AGP modern
+          if ver(current) < ver("8.7"):
+              text = re.sub(
+                  r"gradle-[0-9]+(?:\.[0-9]+){1,2}-",
+                  "gradle-8.11.1-",
+                  text,
+              )
+              open(path, "w", encoding="utf-8").write(text)
+              print("Gradle wrapper patched to 8.11.1")
+          else:
+              print("Gradle wrapper OK:", current)
+          PY
+
+          chmod +x android/gradlew
+          ./android/gradlew --version || true
+
+      - name: "12 • Flutter clean + pub get"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd project
+          flutter clean
+          flutter pub get
+
+      - name: "13 • Preflight"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd project
+          test -f pubspec.yaml
+          test -f lib/main.dart
+          test -d android
+          test -f android/gradlew
+          test -f android/app/src/main/AndroidManifest.xml
+          flutter analyze lib/main.dart || true
+          echo "Web2APK preflight: PASSED"
+
+      - name: "14 • Build APK"
+        shell: bash
+        run: |
+          set -o pipefail
+          cd project
+          rm -f flutter_build.log
+          flutter build apk --release --no-pub 2>&1 | tee flutter_build.log
+
+      - name: "15 • Collect APK"
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          find project/build/app/outputs -type f -name "*.apk" -exec cp {} output/ \;
+          if ! find output -type f -name "*.apk" | grep -q .; then
+            echo "ERROR: APK tidak ditemukan"
+            find project/build -type f | head -n 80 || true
+            exit 1
+          fi
+          ls -lh output/*.apk
+
+      - name: "16 • Upload APK"
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ inputs.jobId }}
-          path: app/build/outputs/apk/release/*.apk
+          path: output/*.apk
           if-no-files-found: error
           retention-days: 2
+          compression-level: 0
+          overwrite: true
 
-      - name: 09 • Diagnostics on failure
-        if: failure()
-        run: |
-          echo '--- build diagnostics ---'
-          java -version || true
-          gradle --version || true
-          find app -maxdepth 5 -type f | sort | head -200 || true
+      - name: "17 • Upload diagnostics"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ inputs.jobId }}
+          path: |
+            project/flutter_build.log
+            project/pubspec.yaml
+            project/lib/main.dart
+            project/android/gradle/wrapper/gradle-wrapper.properties
+            project/android/app/src/main/AndroidManifest.xml
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 0
+          overwrite: true
