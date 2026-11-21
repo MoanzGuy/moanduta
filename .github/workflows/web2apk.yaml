@@ -1,94 +1,110 @@
-name: Web to APK Build
+# DUTA Web → APK
+# Kontrak SC bot (server.js triggerWeb2ApkWorkflow):
+#   workflow_dispatch inputs: jobId, userId, payload (JSON)
+#   payload: { mode, url, appName, iconUrl, jobId, userId }
+# Artifact WAJIB: name apk-${{ inputs.jobId }}  path output/app.apk
 
-# Ditrigger oleh bot Telegram (Tirzz Build Bot) lewat workflow_dispatch.
-# Input dikirim oleh server.js -> triggerWeb2ApkWorkflow().
-"on":
+name: DUTA Web2APK
+
+on:
   workflow_dispatch:
     inputs:
-      web_url:
-        description: "URL website yang mau dibungkus jadi APK (WebView)"
+      jobId:
+        description: Build job ID from SC bot
         required: true
         type: string
-      app_name:
-        description: "Nama aplikasi (ditampilkan di home screen)"
-        required: true
-        type: string
-      icon_url:
-        description: "URL icon PNG (opsional)"
+      userId:
+        description: Telegram user ID
         required: false
-        default: ""
+        default: "0"
         type: string
-      tag:
-        description: "Tag unik build"
+      payload:
+        description: JSON payload { url, appName, iconUrl, ... }
         required: true
         type: string
-
-# PENTING: input di atas berasal langsung dari user Telegram, jadi TIDAK BOLEH
-# diinterpolasi pakai ${{ github.event.inputs.x }} di dalam "run:" (celah shell
-# injection). Semua dipindah ke `env:` lebih dulu dan dipakai lewat variabel
-# shell ($WEB_URL, dst), dan untuk isi source Dart dipakai --dart-define
-# (bukan ditulis manual ke file .dart) supaya nilainya tidak pernah jadi kode.
-env:
-  WEB_URL: ${{ github.event.inputs.web_url }}
-  APP_NAME: ${{ github.event.inputs.app_name }}
-  ICON_URL: ${{ github.event.inputs.icon_url }}
-  BUILD_TAG: ${{ github.event.inputs.tag }}
 
 permissions:
   contents: read
 
 concurrency:
-  group: web2apk-build-${{ github.event.inputs.tag }}
+  group: duta-web2apk-${{ inputs.jobId }}
   cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      JOB_ID: ${{ inputs.jobId }}
+      USER_ID: ${{ inputs.userId }}
+      PAYLOAD: ${{ inputs.payload }}
+      GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
     steps:
-      - name: Validasi input
+      - name: Parse payload SC bot
+        shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${WEB_URL:-}" ]; then
-            echo "::error::Input web_url kosong."
-            exit 1
-          fi
-          case "$WEB_URL" in
-            http://*|https://*) ;;
-            *) echo "::error::web_url harus diawali http:// atau https://"; exit 1 ;;
-          esac
-          if [ -z "${APP_NAME:-}" ]; then
-            echo "::error::Input app_name kosong."
-            exit 1
-          fi
-          if [ -z "${BUILD_TAG:-}" ]; then
-            echo "::error::Input tag kosong."
-            exit 1
-          fi
+          python3 - <<'PY'
+          import json, os, sys, re
+          try:
+              p = json.loads(os.environ["PAYLOAD"])
+          except Exception as e:
+              print(f"Invalid payload JSON: {e}")
+              sys.exit(1)
 
-      - name: Setup Java
+          url = str(p.get("url") or p.get("web_url") or p.get("webUrl") or "").strip()
+          app_name = str(p.get("appName") or p.get("app_name") or "Web App").strip() or "Web App"
+          icon_url = str(p.get("iconUrl") or p.get("icon_url") or "").strip()
+          job_id = str(p.get("jobId") or os.environ.get("JOB_ID") or "").strip()
+
+          if not url.startswith(("http://", "https://")):
+              print(f"Invalid URL: {url!r}")
+              sys.exit(1)
+
+          # Sanitasi nama app (hindari karakter aneh di label Android)
+          app_name = re.sub(r'[\x00-\x1f]', '', app_name)[:40]
+
+          def esc(s):
+              return str(s).replace("%", "%25").replace("\n", "%0A").replace("\r", "%0D")
+
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"WEB_URL={esc(url)}\n")
+              f.write(f"APP_NAME={esc(app_name)}\n")
+              f.write(f"ICON_URL={esc(icon_url)}\n")
+              f.write(f"BUILD_JOB_ID={esc(job_id)}\n")
+
+          print(f"URL={url}")
+          print(f"APP_NAME={app_name}")
+          print(f"ICON={bool(icon_url)}")
+          print(f"JOB_ID={job_id}")
+          PY
+
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: "temurin"
+          distribution: temurin
           java-version: "17"
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: "stable"
+          channel: stable
           cache: true
 
       - name: Buat project Flutter WebView
-        run: flutter create --org com.tirzz.web2apk --project-name web2apk_app webapp
+        run: |
+          set -euo pipefail
+          # package name aman (huruf kecil, underscore)
+          SAFE_PKG="$(echo "${APP_NAME}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '_' | sed 's/^_//;s/_$//;s/__*/_/g')"
+          SAFE_PKG="${SAFE_PKG:-web2apk}"
+          SAFE_PKG="$(echo "$SAFE_PKG" | cut -c1-20)"
+          flutter create --org com.duta.web2apk --project-name "w2a_${SAFE_PKG}" webapp
 
       - name: Tambah dependency webview_flutter
         working-directory: webapp
         run: flutter pub add webview_flutter
 
-      # File ini STATIS (heredoc pakai 'EOF' berkutip supaya tidak ada variabel
-      # shell yang di-expand ke dalamnya). URL & nama app di-inject aman lewat
-      # --dart-define saat build, bukan ditulis langsung ke source.
-      - name: Tulis lib/main.dart (template statis)
+      - name: Tulis lib/main.dart (template aman via dart-define)
         working-directory: webapp
         run: |
           cat > lib/main.dart << 'EOF'
@@ -151,7 +167,7 @@ jobs:
             Widget build(BuildContext context) {
               return PopScope(
                 canPop: false,
-                onPopInvoked: (didPop) async {
+                onPopInvokedWithResult: (didPop, _) async {
                   if (didPop) return;
                   if (await _onWillPop()) {
                     if (context.mounted) Navigator.of(context).maybePop();
@@ -172,59 +188,56 @@ jobs:
           }
           EOF
 
-      - name: Set nama aplikasi di AndroidManifest.xml
+      - name: Set label AndroidManifest
         working-directory: webapp
         run: |
-          python3 - << 'PYEOF'
-          import os
+          python3 - <<'PY'
+          import os, re
           from xml.sax.saxutils import escape
-
-          app_name = escape(os.environ["APP_NAME"])
-          manifest_path = "android/app/src/main/AndroidManifest.xml"
-
-          with open(manifest_path, "r", encoding="utf-8") as f:
+          app_name = escape(os.environ.get("APP_NAME", "Web App"))
+          path = "android/app/src/main/AndroidManifest.xml"
+          with open(path, "r", encoding="utf-8") as f:
               content = f.read()
-
-          import re
-          new_content, count = re.subn(
-              r'android:label="[^"]*"',
-              f'android:label="{app_name}"',
-              content,
-              count=1,
-          )
+          new_content, count = re.subn(r'android:label="[^"]*"', f'android:label="{app_name}"', content, count=1)
           if count == 0:
-              raise SystemExit("android:label tidak ditemukan di AndroidManifest.xml")
-
-          with open(manifest_path, "w", encoding="utf-8") as f:
+              raise SystemExit("android:label tidak ditemukan")
+          with open(path, "w", encoding="utf-8") as f:
               f.write(new_content)
-
-          print(f"AndroidManifest.xml label diset ke: {app_name}")
-          PYEOF
+          print("label:", app_name)
+          PY
 
       - name: Download & pasang icon (opsional)
-        if: ${{ github.event.inputs.icon_url != '' }}
+        if: ${{ env.ICON_URL != '' }}
         working-directory: webapp
         run: |
           set -euo pipefail
           mkdir -p assets/icon
-          curl -fL --retry 3 --retry-delay 5 -o assets/icon/icon.png "$ICON_URL"
-
+          curl -fL --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 120 \
+            -A "DUTA-WEB2APK/1.0" \
+            -o assets/icon/icon.png "$ICON_URL" || {
+              echo "Icon download gagal — lanjut tanpa custom icon"
+              exit 0
+            }
+          # Validasi minimal file image
+          if [ ! -s assets/icon/icon.png ]; then
+            echo "Icon kosong — skip"
+            exit 0
+          fi
           cat >> pubspec.yaml << 'EOF'
 
-          flutter_icons:
+          flutter_launcher_icons:
             android: true
             ios: false
             image_path: "assets/icon/icon.png"
           EOF
-
-          flutter pub add --dev flutter_launcher_icons
-          dart run flutter_launcher_icons
+          flutter pub add --dev flutter_launcher_icons || true
+          dart run flutter_launcher_icons || echo "launcher_icons skip"
 
       - name: flutter pub get
         working-directory: webapp
         run: flutter pub get
 
-      - name: Build APK (release)
+      - name: Build APK release
         working-directory: webapp
         run: |
           set -euo pipefail
@@ -232,27 +245,27 @@ jobs:
             --dart-define=WEB_URL="$WEB_URL" \
             --dart-define=APP_NAME="$APP_NAME"
 
-      - name: Kumpulkan hasil APK
-        id: apk
+      - name: Collect APK
         run: |
           set -euo pipefail
-          APK_PATH="$(find webapp -type f -name '*.apk' -path '*/outputs/flutter-apk/*' | sort | head -n 1)"
-          if [ -z "$APK_PATH" ]; then
-            echo "::error::Build sukses tapi file .apk tidak ditemukan."
+          mkdir -p output
+          APK="$(find webapp -type f -name '*.apk' -path '*/outputs/flutter-apk/*' | sort | head -n 1 || true)"
+          if [ -z "${APK:-}" ]; then
+            APK="$(find webapp -type f -name '*.apk' -size +100k | head -n 1 || true)"
+          fi
+          if [ -z "${APK:-}" ]; then
+            echo "::error::APK tidak ditemukan"
+            find webapp -name '*.apk' -print || true
             exit 1
           fi
-          mkdir -p apk_output
-          SAFE_TAG="$(echo "$BUILD_TAG" | tr -c 'A-Za-z0-9._-' '_')"
-          DEST="apk_output/web2apk-${SAFE_TAG}.apk"
-          cp "$APK_PATH" "$DEST"
-          echo "path=$DEST" >> "$GITHUB_OUTPUT"
-          echo "name=apk-build-${SAFE_TAG}" >> "$GITHUB_OUTPUT"
+          cp "$APK" output/app.apk
+          echo "APK: $APK ($(du -h output/app.apk | cut -f1))"
 
-      - name: Upload APK sebagai artifact
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          # Nama HARUS mengandung kata "apk" atau "build" â€” dibaca oleh bot
-          name: ${{ steps.apk.outputs.name }}
-          path: ${{ steps.apk.outputs.path }}
-          retention-days: 1
+          # SC bot mencari artifact yang namanya mulai "apk-"
+          name: apk-${{ inputs.jobId }}
+          path: output/app.apk
           if-no-files-found: error
+          retention-days: 2
