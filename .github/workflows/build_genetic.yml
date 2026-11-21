@@ -148,7 +148,6 @@ jobs:
           fi
           unzip -q input/source.zip -d workspace
 
-          # Flatten single top-level folder
           COUNT=$(find workspace -mindepth 1 -maxdepth 1 | wc -l)
           if [ "$COUNT" -eq 1 ]; then
             ONLY=$(find workspace -mindepth 1 -maxdepth 1 -type d | head -1 || true)
@@ -167,18 +166,43 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android SDK packages
+      # FIX: android-actions/setup-android@v3 gagal karena package 'tools' sudah dihapus di cmdline-tools baru.
+      # Install cmdline-tools + packages manual, set ANDROID_HOME.
+      - name: Setup Android SDK (cmdline-tools, no obsolete tools package)
+        shell: bash
         run: |
           set -euo pipefail
-          sdkmanager "platform-tools" || true
-          sdkmanager "platforms;android-34" || true
-          sdkmanager "platforms;android-35" || true
-          sdkmanager "build-tools;34.0.0" || true
-          sdkmanager "build-tools;35.0.0" || true
-          yes | sdkmanager --licenses >/dev/null || true
+          ANDROID_HOME="${ANDROID_HOME:-$HOME/android-sdk}"
+          export ANDROID_HOME
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+
+          if [ ! -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            echo "Downloading Android cmdline-tools..."
+            curl -fsSL "https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip" -o /tmp/cmdtools.zip
+            rm -rf /tmp/cmdline-tools-extract
+            unzip -q /tmp/cmdtools.zip -d /tmp/cmdline-tools-extract
+            rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+            mkdir -p "$ANDROID_HOME/cmdline-tools/latest"
+            # zip berisi folder cmdline-tools/
+            if [ -d /tmp/cmdline-tools-extract/cmdline-tools ]; then
+              mv /tmp/cmdline-tools-extract/cmdline-tools/* "$ANDROID_HOME/cmdline-tools/latest/"
+            else
+              mv /tmp/cmdline-tools-extract/* "$ANDROID_HOME/cmdline-tools/latest/"
+            fi
+            chmod +x "$ANDROID_HOME/cmdline-tools/latest/bin/"* || true
+          fi
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses >/dev/null || true
+          "$sdkmanager" "platform-tools" "platforms;android-34" "platforms;android-35" "build-tools;34.0.0" "build-tools;35.0.0" || true
+          yes | "$sdkmanager" --licenses >/dev/null || true
+          echo "SDK ready:"
+          ls "$ANDROID_HOME" | head -20
+          df -h /
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -220,7 +244,6 @@ jobs:
           if $has_html; then echo "type=webview" >> "$GITHUB_OUTPUT"; exit 0; fi
           echo "type=unknown" >> "$GITHUB_OUTPUT"
 
-      # ─── FLUTTER ───────────────────────────────────────────────────
       - name: Setup Flutter
         if: steps.detect.outputs.type == 'flutter'
         uses: subosito/flutter-action@v2
@@ -256,7 +279,6 @@ jobs:
           if [ -z "$APK" ]; then echo "::error::APK Flutter tidak ditemukan."; exit 1; fi
           cp "$APK" output/app.apk
 
-      # ─── NATIVE ANDROID / GENETIC ──────────────────────────────────
       - name: Generate app icons (genetic)
         if: steps.detect.outputs.type == 'android'
         shell: bash
@@ -273,13 +295,11 @@ jobs:
         run: |
           set -euo pipefail
           ROOT=""
-          # Prefer android/ subfolder (Base Genetic style)
           if [ -f workspace/android/settings.gradle ] || [ -f workspace/android/settings.gradle.kts ]; then
             ROOT="workspace/android"
           elif [ -f workspace/android/gradlew ]; then
             ROOT="workspace/android"
           fi
-          # settings.gradle + gradlew together
           if [ -z "$ROOT" ]; then
             while IFS= read -r s; do
               d="$(dirname "$s")"
@@ -326,7 +346,6 @@ jobs:
           fi
           mkdir -p gradle/wrapper
 
-          # Download wrapper jar if missing
           if [ ! -f "gradle/wrapper/gradle-wrapper.jar" ]; then
             echo "Downloading gradle-wrapper.jar..."
             curl -fsSL "https://raw.githubusercontent.com/gradle/gradle/v${GRADLE_VER}.0/gradle/wrapper/gradle-wrapper.jar" \
@@ -370,7 +389,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
           if [ -n "${ANDROID_HOME:-}" ]; then
             echo "sdk.dir=${ANDROID_HOME}" > local.properties
           elif [ -n "${ANDROID_SDK_ROOT:-}" ]; then
@@ -378,7 +396,6 @@ jobs:
           fi
           cat local.properties || true
 
-          # Release tanpa keystore sering gagal — inject signingConfig debug ke app/build.gradle
           APP_BG=""
           if [ -f "app/build.gradle" ]; then APP_BG="app/build.gradle"; fi
           if [ -f "app/build.gradle.kts" ]; then APP_BG="app/build.gradle.kts"; fi
@@ -456,7 +473,6 @@ jobs:
           cp "$APK" output/app.apk
           echo "APK: $APK ($(du -h output/app.apk | cut -f1))"
 
-      # ─── UNKNOWN ───────────────────────────────────────────────────
       - name: Fail if unknown project
         if: steps.detect.outputs.type == 'unknown'
         run: |
